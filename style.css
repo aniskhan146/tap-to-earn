@@ -1,0 +1,18 @@
+body {
+    font-family: Arial, sans-serif;
+    text-align: center;
+    background: #f4f4f4;
+}
+.container {
+    margin-top: 50px;
+}
+button {
+    padding: 10px 20px;
+    background: gold;
+    border: none;
+    cursor: pointer;
+    font-size: 18px;
+}
+button:hover {
+    background: orange;
+}
