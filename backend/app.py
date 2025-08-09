@@ -1,72 +1,122 @@
-from flask import Flask, jsonify, request
-from flask_cors import CORS
+# backend/app.py
 import sqlite3
+import time
+from flask import Flask, request, jsonify, g
+from flask_cors import CORS
 import os
-from datetime import datetime
+import hmac
+import hashlib
+from urllib.parse import parse_qs
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, supports_credentials=True)
 
-DB_NAME = "users.db"
+DATABASE = os.path.join(os.path.dirname(__file__), 'data.db')
+BOT_TOKEN = os.environ.get('TG_BOT_TOKEN')
 
-# ডাটাবেস তৈরি
+# DB helper functions
+def get_db():
+    db = getattr(g, '_database', None)
+    if db is None:
+        db = g._database = sqlite3.connect(DATABASE, check_same_thread=False)
+        db.row_factory = sqlite3.Row
+    return db
+
+@app.teardown_appcontext
+def close_connection(exception):
+    db = getattr(g, '_database', None)
+    if db is not None:
+        db.close()
+
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    username TEXT,
-                    balance INTEGER DEFAULT 0,
-                    last_mine TEXT
-                )''')
-    conn.commit()
-    conn.close()
+    with app.app_context():
+        db = get_db()
+        with open(os.path.join(os.path.dirname(__file__), 'db_init.sql')) as f:
+            db.executescript(f.read())
+        db.commit()
 
-init_db()
+if not os.path.exists(DATABASE):
+    init_db()
 
-# মাইনিং ফাংশন
-@app.route('/mine', methods=['POST'])
-def mine():
-    username = request.json.get("username")
-    if not username:
-        return jsonify({"error": "Username required"}), 400
+def get_or_create_user(telegram_id):
+    db = get_db()
+    cur = db.execute('SELECT * FROM users WHERE telegram_id=?', (telegram_id,))
+    row = cur.fetchone()
+    if row:
+        return row
+    db.execute('INSERT INTO users(telegram_id, points, last_tap) VALUES(?,?,?)', (telegram_id, 0, 0))
+    db.commit()
+    cur = db.execute('SELECT * FROM users WHERE telegram_id=?', (telegram_id,))
+    return cur.fetchone()
 
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
+# Rate limiting params
+MIN_INTERVAL_MS = 200  # minimum ms between taps
+POINTS_PER_TAP = 1
 
-    # ইউজার চেক
-    c.execute("SELECT balance, last_mine FROM users WHERE username=?", (username,))
-    user = c.fetchone()
+# Telegram init_data verification function
+def verify_telegram_init_data(init_data: str, bot_token: str) -> bool:
+    secret_key = hashlib.sha256(bot_token.encode()).digest()
 
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Parse key=value pairs excluding 'hash'
+    data_params = dict(pair.split('=') for pair in init_data.split('&') if not pair.startswith('hash'))
+    sorted_items = sorted(data_params.items())
+    data_check_string = '\n'.join(f"{k}={v}" for k, v in sorted_items)
 
-    if user:
-        # আগের থেকে আছে, তাহলে ব্যালেন্স +1
-        new_balance = user[0] + 1
-        c.execute("UPDATE users SET balance=?, last_mine=? WHERE username=?", (new_balance, now, username))
-    else:
-        # নতুন ইউজার
-        c.execute("INSERT INTO users (username, balance, last_mine) VALUES (?, ?, ?)", (username, 1, now))
+    hmac_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
 
-    conn.commit()
-    conn.close()
+    qs = parse_qs(init_data)
+    received_hash = qs.get('hash', [None])[0]
 
-    return jsonify({"message": "Mined successfully", "username": username, "new_balance": user[0] + 1 if user else 1})
+    return hmac_hash == received_hash
 
-# ব্যালেন্স চেক
-@app.route('/balance/<username>', methods=['GET'])
-def balance(username):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT balance FROM users WHERE username=?", (username,))
-    user = c.fetchone()
-    conn.close()
+@app.route('/api/tap', methods=['POST'])
+def tap():
+    data = request.get_json() or {}
 
-    if user:
-        return jsonify({"username": username, "balance": user[0]})
-    else:
-        return jsonify({"username": username, "balance": 0})
+    init_data = data.get('init_data')
+    if not init_data:
+        return jsonify({'error': 'missing init_data'}), 400
+
+    if not BOT_TOKEN:
+        return jsonify({'error': 'server misconfiguration, missing BOT_TOKEN'}), 500
+
+    if not verify_telegram_init_data(init_data, BOT_TOKEN):
+        return jsonify({'error': 'invalid init_data signature'}), 403
+
+    # Parse telegram_id from init_data
+    parsed = dict(pair.split('=') for pair in init_data.split('&'))
+    telegram_id = parsed.get('user.id')
+    if not telegram_id:
+        # try alternate key or error
+        return jsonify({'error': 'telegram_id not found in init_data'}), 400
+
+    now_ms = int(time.time() * 1000)
+
+    user = get_or_create_user(telegram_id)
+    last_tap = user['last_tap'] or 0
+    if now_ms - last_tap < MIN_INTERVAL_MS:
+        return jsonify({'error': 'rate_limited', 'retry_after_ms': MIN_INTERVAL_MS - (now_ms - last_tap)}), 429
+
+    # Update points and last_tap
+    db = get_db()
+    new_points = user['points'] + POINTS_PER_TAP
+    db.execute('UPDATE users SET points=?, last_tap=? WHERE telegram_id=?', (new_points, now_ms, telegram_id))
+    db.execute('INSERT INTO taps(telegram_id, ts, count) VALUES(?,?,?)', (telegram_id, now_ms, 1))
+    db.commit()
+
+    return jsonify({'points': new_points})
+
+@app.route('/api/balance', methods=['GET'])
+def balance():
+    telegram_id = request.args.get('telegram_id')
+    if not telegram_id:
+        return jsonify({'error': 'missing telegram_id'}), 400
+    db = get_db()
+    cur = db.execute('SELECT points FROM users WHERE telegram_id=?', (telegram_id,))
+    row = cur.fetchone()
+    if not row:
+        return jsonify({'points': 0})
+    return jsonify({'points': row['points']})
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
