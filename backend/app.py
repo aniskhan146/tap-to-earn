@@ -1,20 +1,17 @@
-# backend/app.py
 import sqlite3
 import time
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 import os
-import hmac
-import hashlib
-from urllib.parse import parse_qs
+import json
+import urllib.parse
+
+DATABASE = os.path.join(os.path.dirname(__file__), 'data.db')
 
 app = Flask(__name__)
 CORS(app, supports_credentials=True)
 
-DATABASE = os.path.join(os.path.dirname(__file__), 'data.db')
-BOT_TOKEN = os.environ.get('TG_BOT_TOKEN')
-
-# DB helper functions
+# DB helper
 def get_db():
     db = getattr(g, '_database', None)
     if db is None:
@@ -38,69 +35,69 @@ def init_db():
 if not os.path.exists(DATABASE):
     init_db()
 
-def get_or_create_user(telegram_id):
+def parse_telegram_init_data(init_data):
+    try:
+        params = dict(pair.split('=') for pair in init_data.split('&'))
+        user_json = params.get('user')
+        if user_json:
+            user_json = urllib.parse.unquote(user_json)
+            user_data = json.loads(user_json)
+            return user_data
+    except Exception as e:
+        print("Failed to parse initData:", e)
+    return {}
+
+def get_or_create_user(telegram_data, platform='unknown'):
+    telegram_id = telegram_data.get('id')
+    username = telegram_data.get('username')
+    first_name = telegram_data.get('first_name')
+    last_name = telegram_data.get('last_name')
+    now = int(time.time())
+
     db = get_db()
     cur = db.execute('SELECT * FROM users WHERE telegram_id=?', (telegram_id,))
     row = cur.fetchone()
     if row:
-        return row
-    db.execute('INSERT INTO users(telegram_id, points, last_tap) VALUES(?,?,?)', (telegram_id, 0, 0))
+        db.execute('UPDATE users SET last_active=?, platform=?, username=?, first_name=?, last_name=? WHERE telegram_id=?',
+                   (now, platform, username, first_name, last_name, telegram_id))
+        db.commit()
+        return db.execute('SELECT * FROM users WHERE telegram_id=?', (telegram_id,)).fetchone()
+
+    db.execute(
+        'INSERT INTO users (telegram_id, username, first_name, last_name, platform, points, last_tap, created_at, last_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        (telegram_id, username, first_name, last_name, platform, 0, 0, now, now)
+    )
     db.commit()
-    cur = db.execute('SELECT * FROM users WHERE telegram_id=?', (telegram_id,))
-    return cur.fetchone()
+    return db.execute('SELECT * FROM users WHERE telegram_id=?', (telegram_id,)).fetchone()
 
-# Rate limiting params
-MIN_INTERVAL_MS = 200  # minimum ms between taps
+MIN_INTERVAL_MS = 200
 POINTS_PER_TAP = 1
-
-# Telegram init_data verification function
-def verify_telegram_init_data(init_data: str, bot_token: str) -> bool:
-    secret_key = hashlib.sha256(bot_token.encode()).digest()
-
-    # Parse key=value pairs excluding 'hash'
-    data_params = dict(pair.split('=') for pair in init_data.split('&') if not pair.startswith('hash'))
-    sorted_items = sorted(data_params.items())
-    data_check_string = '\n'.join(f"{k}={v}" for k, v in sorted_items)
-
-    hmac_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-
-    qs = parse_qs(init_data)
-    received_hash = qs.get('hash', [None])[0]
-
-    return hmac_hash == received_hash
 
 @app.route('/api/tap', methods=['POST'])
 def tap():
     data = request.get_json() or {}
-
     init_data = data.get('init_data')
+    platform = data.get('platform', 'unknown')
+
     if not init_data:
         return jsonify({'error': 'missing init_data'}), 400
 
-    if not BOT_TOKEN:
-        return jsonify({'error': 'server misconfiguration, missing BOT_TOKEN'}), 500
+    telegram_user = parse_telegram_init_data(init_data)
+    if not telegram_user or 'id' not in telegram_user:
+        return jsonify({'error': 'invalid init_data'}), 400
 
-    if not verify_telegram_init_data(init_data, BOT_TOKEN):
-        return jsonify({'error': 'invalid init_data signature'}), 403
-
-    # Parse telegram_id from init_data
-    parsed = dict(pair.split('=') for pair in init_data.split('&'))
-    telegram_id = parsed.get('user.id')
-    if not telegram_id:
-        # try alternate key or error
-        return jsonify({'error': 'telegram_id not found in init_data'}), 400
+    user = get_or_create_user(telegram_user, platform)
+    telegram_id = user['telegram_id']
 
     now_ms = int(time.time() * 1000)
-
-    user = get_or_create_user(telegram_id)
     last_tap = user['last_tap'] or 0
     if now_ms - last_tap < MIN_INTERVAL_MS:
-        return jsonify({'error': 'rate_limited', 'retry_after_ms': MIN_INTERVAL_MS - (now_ms - last_tap)}), 429
+        return jsonify({'error': 'rate_limited', 'retry_after_ms': MIN_INTERVAL_MS - (now_ms-last_tap)}), 429
 
-    # Update points and last_tap
     db = get_db()
     new_points = user['points'] + POINTS_PER_TAP
-    db.execute('UPDATE users SET points=?, last_tap=? WHERE telegram_id=?', (new_points, now_ms, telegram_id))
+    db.execute('UPDATE users SET points=?, last_tap=?, last_active=?, platform=? WHERE telegram_id=?',
+               (new_points, now_ms, int(time.time()), platform, telegram_id))
     db.execute('INSERT INTO taps(telegram_id, ts, count) VALUES(?,?,?)', (telegram_id, now_ms, 1))
     db.commit()
 

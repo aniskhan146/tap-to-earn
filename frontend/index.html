@@ -1,19 +1,23 @@
-<!DOCTYPE html>
-<html lang="en">
+<!doctype html>
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Tap to Earn</title>
-    <link rel="stylesheet" href="style.css">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tap-to-Earn</title>
+  <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-    <div class="container">
-        <h1>💰 Tap to Earn</h1>
-        <input type="text" id="username" placeholder="Enter your username">
-        <button id="mineBtn">⛏️ Mine</button>
-        <p id="status"></p>
-        <p id="balance">Balance: 0</p>
-    </div>
-    <script src="script.js"></script>
+  <div id="app">
+    <h1>Tap-to-Earn</h1>
+    <div id="balance">Points: <span id="points">0</span></div>
+    <button id="tapBtn">TAP</button>
+    <div id="msg"></div>
+  </div>
+
+  <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
+  <script>
+    const API_BASE = 'https://tap-to-earn-18kw.onrender.com/api'; // তোমার backend URL
+  </script>
+  <script src="app.js"></script>
 </body>
 </html>
