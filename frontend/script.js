@@ -1,4 +1,4 @@
-const backendURL = "https://your-backend.onrender.com";
+const backendURL = "https://tap-to-earn-18kw.onrender.com";
 
 document.getElementById("mineBtn").addEventListener("click", () => {
     const username = document.getElementById("username").value;
